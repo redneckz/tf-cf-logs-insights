@@ -1,0 +1,290 @@
+---
+title: "R Notebook"
+output:
+  pdf_document: 
+    toc: yes
+  html_notebook: default
+  html_document: 
+    toc: yes
+---
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, comment = NA)
+```
+
+# Preliminary CloudFront Logs Analysis
+
+```{r}
+suppressWarnings(suppressMessages(library(rgeolocate, quietly = TRUE)))
+
+logs.data <- read.csv2(file = "./data/master.tsv", header = TRUE, sep = "\t", quote = "\"")
+logs.data.cols <- colnames(logs.data)
+
+logs.data$sc.bytes <- as.numeric(logs.data$sc.bytes)
+logs.data$cs.bytes <- as.numeric(logs.data$cs.bytes)
+logs.data$time.taken <- as.numeric(logs.data$time.taken)
+logs.data$time.to.first.byte <- as.numeric(logs.data$time.to.first.byte)
+
+file <- system.file("extdata", "GeoLite2-Country.mmdb", package = "rgeolocate")
+logs.data <- cbind(logs.data, maxmind(logs.data$c.ip, file))
+
+logs.data.method.get <- logs.data[logs.data$cs.method == "GET",]
+logs.data.method.head <- logs.data[logs.data$cs.method == "HEAD",]
+logs.data.method.opts <- logs.data[logs.data$cs.method == "OPTIONS",]
+logs.data.method.post <- logs.data[logs.data$cs.method == "POST",]
+logs.data.method.put <- logs.data[logs.data$cs.method == "PUT",]
+logs.data.method.del <- logs.data[logs.data$cs.method == "DELETE",]
+
+```
+
+Logs were taken from [tf-front-logs-production/master](https://s3.console.aws.amazon.com/s3/buckets/tf-front-logs-production/master/?region=us-east-1&tab=overview) for the periods from `r min(logs.data$date)` to `r max(logs.data$date)`
+
+## Analysis Overview
+
+1. Majority of requests are tiny *~1KB*
+2. Cache efficiency is high enough *~40%*
+3. Top3 error types: *Error* (doesnt fit any of the other categories), *ClientCommError* (due to a communication problem between CloudFront and the viewer), *OriginError* (origin returned an incorrect response)
+4. Majority of latencies are small ~1s due to efficient caching. But there are huge outliers ~$10^6$ seconds.
+5. Latency outliers related to *China* and *United States*.
+6. There is strong relationship between latency outliers and bytes consumed (incoming traffic).
+
+## Fields
+
+```{r, results='asis'}
+suppressWarnings(suppressMessages(library(knitr, quietly = TRUE)))
+
+kable(data.frame(
+  Field = logs.data.cols,
+  Description = c("The date on which the event occurred in the format YYYY-MM-DD", "The time when the CloudFront server finished responding to the request (in UTC), for example, 01:42:39", "The edge location that served the request. Each edge location is identified by a three-letter code and an arbitrarily assigned number, for example, DFW3. The three-letter code typically corresponds with the International Air Transport Association airport code for an airport near the edge location.", "The total number of bytes that CloudFront served to the viewer in response to the request, including headers, for example, 1045619.", "The IP address of the viewer that made the request", "The HTTP request method: DELETE, GET, HEAD, OPTIONS, PATCH, POST, or PUT", "The domain name of the CloudFront distribution", "The portion of the URI that identifies the path and object, for example, /images/cat.jpg", "One of the following values: An HTTP status code; 000, which indicates that the viewer closed the connection (for example, closed the browser tab) before CloudFront could respond to a request", "The name of the domain that originated the request", "The value of the User-Agent header in the request", "The query string portion of the URI, if any", "The cookie header in the request, including name-value pairs and the associated attributes", "How CloudFront classifies the response after the last byte left the edge location: Hit, RefreshHit, Miss, LimitExceeded, CapacityExceeded, Error, Redirect", "An encrypted string that uniquely identifies a request", "The value that the viewer included in the Host header for this request", "The protocol that the viewer specified in the request: http, https, ws, or wss", "The number of bytes of data that the viewer included in the request, including headers", "The number of seconds (to the thousandth of a second, for example, 0.002) between the time that a CloudFront edge server receives a viewer's request and the time that CloudFront writes the last byte of the response to the edge server's output queue as measured on the server", "If the viewer used an HTTP proxy or a load balancer to send the request, the value of c-ip in field 5 is the IP address of the proxy or load balancer. In that case, this field is the IP address of the viewer that originated the request. This field contains IPv4 addresses (such as 192.0.2.44) and IPv6 addresses, as applicable.", "Possible values include the following: SSLv3, TLSv1, TLSv1.1, TLSv1.2", "Possible values include the following: ECDHE-RSA-AES128-GCM-SHA256, ECDHE-RSA-AES128-SHA256, ECDHE-RSA-AES128-SHA, ECDHE-RSA-AES256-GCM-SHA384, ECDHE-RSA-AES256-SHA384, ECDHE-RSA-AES256-SHA, AES128-GCM-SHA256, ...", "How CloudFront classified the response just before returning the response to the viewer. See also x-edge-result-type in field 14.", "Possible values include: HTTP/0.9, HTTP/1.0, HTTP/1.1, HTTP/2.0", "When field-level encryption is configured for a distribution, this field contains a code that indicates whether the request body was successfully processed. If field-level encryption is not configured for the distribution, the value of this field is a hyphen (-).", "The number of fields that CloudFront encrypted and forwarded to the origin", "The port number of the request from the viewer", "The number of seconds between receiving the request and writing the first byte of the response, as measured on the server", "When x-edge-result-type (field 14) is not Error, this field contains the same value as x-edge-result-type. When x-edge-result-type is Error, this field contains the specific type of error: AbortedOrigin, ClientCommError, ClientGeoBlocked, ClientHungUpRequest, Error, InvalidRequest, InvalidRequestBlocked, ...", "The value of the HTTP Content-Type header of the response", "The value of the HTTP Content-Length header of the response", "When the response contains the HTTP Content-Range header, this field contains the range start value", "When the response contains the HTTP Content-Range header, this field contains the range end value")
+))
+```
+
+```{r}
+source("./lhist.R")
+```
+
+## KB per reuest
+
+```{r}
+suppressWarnings(suppressMessages({
+  library(ggplot2, quietly = TRUE)
+  library(scales, quietly = TRUE)
+  library(viridis, quietly = TRUE)
+}))
+
+ggplot(logs.data, aes(x = cs.method, y = (sc.bytes + 1) / 1024, fill = cs.method)) +
+  geom_boxplot() +
+  xlab("Method") + ylab("KB per request") +
+  scale_y_continuous(trans = log2_trans(),
+                     breaks = trans_breaks("log2", function(x) 2^x),
+                     labels = trans_format("log2", math_format(2^.x))) +
+  scale_fill_viridis(discrete = TRUE, alpha = 0.6, option = "A")
+```
+
+As expected majority of outliers inside GET and POST requests.
+
+And what about incoming traffic:
+```{r}
+ggplot(logs.data, aes(x = cs.method, y = (cs.bytes + 1) / 1024, fill = cs.method)) +
+  geom_boxplot() +
+  xlab("Method") + ylab("KB consumed") +
+  scale_y_continuous(trans = log2_trans(),
+                     breaks = trans_breaks("log2", function(x) 2^x),
+                     labels = trans_format("log2", math_format(2^.x))) +
+  scale_fill_viridis(discrete = TRUE, alpha = 0.6, option = "A")
+```
+
+There are lots of GET requests with perceptible incoming traffic.
+
+### GET KB per reuest
+
+```{r}
+lhist(logs.data.method.get$sc.bytes / 1024, buckets = c(0, 128, 1024, 5 * 1024), xlab = "KB per request", ylab = "Freq")
+```
+
+### POST KB per reuest
+
+```{r}
+lhist(logs.data.method.post$sc.bytes / 1024, buckets = c(0, 128, 1024, 7 * 1024), xlab = "KB per request", ylab = "Freq")
+```
+
+## CloudFront Cache Efficiency
+
+```{r}
+x.edge.result.type.get <- factor(logs.data.method.get$x.edge.result.type)
+summary(x.edge.result.type.get)
+```
+
+Level of cache *Hit* events is relatively low compared to level of *Miss* events:
+```{r}
+x.edge.hit <- x.edge.result.type.get[x.edge.result.type.get == "Hit"]
+x.edge.miss <- x.edge.result.type.get[x.edge.result.type.get == "Miss"]
+x.edge.hit.rate <- length(x.edge.hit) / (length(x.edge.hit) + length(x.edge.miss))
+sprintf("%1.1f%%", x.edge.hit.rate * 100)
+```
+
+## CloudFront Errors
+
+Error rate:
+```{r}
+x.edge.result.type <- factor(logs.data$x.edge.result.type)
+x.edge.error <- x.edge.result.type[x.edge.result.type == "Error"]
+x.edge.error.rate <- length(x.edge.error) / length(x.edge.result.type)
+sprintf("%1.1f%%", x.edge.error.rate * 100)
+```
+
+```{r}
+x.edge.detailed.result.type <- factor(logs.data$x.edge.detailed.result.type)
+summary(x.edge.detailed.result.type)
+```
+
+Top 3:
+
+1. *Error* - An error occurred for which the error type doesnâ€™t fit any of the other categories. This error type can occur when CloudFront serves an error response from the CloudFront cache.
+2. *ClientCommError* - The response to the viewer was interrupted due to a communication problem between CloudFront and the viewer.
+3. *OriginError* - The origin returned an incorrect response.
+
+No cases of *LimitExceeded* or *CapacityExceeded*.
+
+## Latency
+
+Time taken:
+```{r}
+suppressWarnings(suppressMessages({
+  library(ggplot2, quietly = TRUE)
+  library(scales, quietly = TRUE)
+  library(viridis, quietly = TRUE)
+}))
+
+ggplot(logs.data, aes(x = time.taken + 0.0001)) +
+  geom_histogram(aes(y = ..density..), colour = "black", fill = "white") +
+  geom_density(alpha = .2, fill = "red") +
+  xlab("Time taken (seconds)") + ylab("Density") +
+  geom_vline(aes(xintercept = median(time.taken)),
+             color = "blue", linetype = "dashed", size = 1) +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                labels = trans_format("log10", math_format(10^.x))) +
+  annotation_logticks()
+```
+
+Time to first byte:
+```{r, warning=FALSE}
+ggplot(logs.data, aes(x = time.to.first.byte + 0.0001)) +
+  geom_histogram(aes(y = ..density..), colour = "black", fill = "white") +
+  geom_density(alpha = .2, fill = "red") +
+  xlab("Time to first byte (seconds)") + ylab("Density") +
+  geom_vline(aes(xintercept = median(time.taken)),
+             color = "blue", linetype = "dashed", size = 1) +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                labels = trans_format("log10", math_format(10^.x))) +
+  annotation_logticks()
+```
+
+### Latency by country
+
+```{r, warning=FALSE}
+suppressWarnings(suppressMessages({
+  library(ggplot2, quietly = TRUE)
+  library(dplyr, quietly = TRUE)
+}))
+
+lat.by_country.summary <- logs.data[, c("time.taken", "time.to.first.byte", "country_name", "country_code")]
+lat.by_country.summary <- lat.by_country.summary %>% group_by(country_code) %>% summarise(
+  country_name = country_name[1],
+  time.taken.med = median(time.taken),
+  time.to.first.byte.med = median(time.to.first.byte),
+  time.taken.max = max(time.taken),
+  time.to.first.byte.max = max(time.to.first.byte),
+  .groups = "drop_last"
+)
+```
+
+```{r}
+ggplot(lat.by_country.summary) +
+  geom_bar(
+    aes(x = reorder(country_name, time.taken.med), y = time.taken.med, fill = -time.taken.med),
+    stat = "identity",
+    alpha = 0.5
+  ) +
+  xlab("Country") + ylab("Median time taken (seconds)") +
+  coord_flip()
+```
+
+```{r}
+ggplot(lat.by_country.summary) +
+  geom_bar(
+    aes(x = reorder(country_name, time.taken.max), y = time.taken.max, fill = -time.taken.max),
+    stat = "identity",
+    alpha = 0.5
+  ) +
+  xlab("Country") + ylab("Max time taken (seconds)") +
+  coord_flip()
+```
+
+There are lots of outliers in "United State", "Belarus", "China". They should be analized separately.
+
+### Latency by result type
+
+```{r}
+suppressWarnings(suppressMessages({
+  library(ggplot2, quietly = TRUE)
+  library(scales, quietly = TRUE)
+  library(viridis, quietly = TRUE)
+}))
+
+ggplot(logs.data, aes(x = x.edge.result.type, y = time.taken + 0.0001, fill = x.edge.result.type)) +
+  geom_boxplot() +
+  xlab("Result type") + ylab("Latency (seconds)") +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                labels = trans_format("log10", math_format(10^.x))) +
+  annotation_logticks() +
+  scale_fill_viridis(discrete = TRUE, alpha = 0.6, option = "A")
+```
+
+### Latency outliers
+
+```{r}
+time.taken.99 <- quantile(logs.data$time.taken, .99)
+```
+Lets focus on values greater than 99% percentile `r time.taken.99[[1]]` (seconds).
+
+Time taken >99%:
+```{r}
+logs.data.out <- logs.data[logs.data$time.taken > time.taken.99,]
+summary(logs.data.out$time.taken)
+```
+
+Countries >99%:
+```{r}
+logs.data.out.countries <- table(logs.data.out$country_name)
+logs.data.out.countries[order(-logs.data.out.countries)]
+```
+
+Result type >99%:
+```{r}
+logs.data.out.res <- table(logs.data.out$x.edge.result.type)
+logs.data.out.res[order(-logs.data.out.res)]
+```
+
+So most of the >99% latencies are due to absence of entries in cache ("Miss").
+It makes sense to eject "Error" and "Hit" categories to find out relationships between latency (time.taken) and other variables.
+
+```{r}
+logs.data.out.miss <- logs.data.out[logs.data.out$x.edge.result.type == "Miss",]
+```
+
+### Latency and bytes consumed
+
+```{r}
+lat.to.cs.bytes <- lm(time.taken ~ cs.bytes, logs.data.out.miss)
+summary(lat.to.cs.bytes)
+```
+
+R-squared is close to 1.0 and p-value is small enough <0.001 to talk about statistically significant linear relationship between latency and bytes consumed (incoming traffic):
+
+```{r}
+ggplot(logs.data.out, aes(x = cs.bytes / 1024, y = time.taken / (60 * 60))) +
+  xlab("KB consumed") + ylab("Latency (hours)") +
+  geom_point() +
+  geom_smooth(method = lm, color = "red", fill = "#69b3a2", se = TRUE)
+```

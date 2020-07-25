@@ -1,0 +1,18 @@
+* text eol=lf
+
+*.Rdata binary
+*.RData binary
+*.rda binary
+*.rdb binary
+*.rds binary
+*.Rd text
+*.rd text
+*.Rdx binary
+*.rdx binary
+*.Rmd text
+*.rmd text
+*.R text
+*.Rproj text
+
+*.gz binary
+*.pdf binary
